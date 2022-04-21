@@ -41,7 +41,7 @@ class Conv(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -100,9 +100,19 @@ class Bottleneck(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c_, c2, 3, 1, g=g)
         self.add = shortcut and c1 == c2
+        self.q_add = torch.nn.quantized.FloatFunctional().add
 
     def forward(self, x):
+        y = self.cv2(self.cv1(x))
+        x.add(y)
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+    def forward_q(self, x):
+        y = self.cv2(self.cv1(x))
+        print(x.type, y.type)
+        print(x.shape, y.shape)
+        x.add(y)
+        return self.q_add(x, self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):

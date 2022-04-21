@@ -124,15 +124,37 @@ class Model(nn.Module):
             self.stride = m.stride
             self._initialize_biases()  # only run once
 
+        # quantized
+        self.quantize = torch.quantization.QuantStub()
+        self.dequantize = torch.quantization.DeQuantStub()
+
         # Init weights, biases
         initialize_weights(self)
         self.info()
         LOGGER.info('')
 
+    def prepare_quantize(self):
+        # modify model
+        self.float()
+        self.train()
+        # self.fuse_cbr()
+        self.fuse()
+        for m in self.model.modules():
+            if isinstance(m, (Bottleneck)):
+                m.forward = m.forward_q  # update forward
+
+        self.forward = self._forward_quantized
+
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
+
+    def _forward_quantized(self, x, augment=False, profile=False, visualize=False):
+        x = self.quantize(x)
+        x = self._forward_once(x, profile, visualize)  # single-scale inference, train
+        x = self.dequantize(x)
+        return x
 
     def _forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width
@@ -231,6 +253,14 @@ class Model(nn.Module):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.forward_fuse  # update forward
+        self.info()
+        return self
+
+    def fuse_cbr(self):  # fuse model Conv2d() + BatchNorm2d() + relu() layers
+        LOGGER.info('Fusing layers... ')
+        for m in self.model.modules():
+            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+                m = torch.quantization.fuse_conv_bn_relu(True, m.conv, m.bn, m.act)
         self.info()
         return self
 
