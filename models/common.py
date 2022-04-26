@@ -49,6 +49,9 @@ class Conv(nn.Module):
     def forward_fuse(self, x):
         return self.act(self.conv(x))
 
+    def forward_fuse2(self, x):
+        return self.conv(x)
+
 
 class DWConv(Conv):
     # Depth-wise convolution class
@@ -100,19 +103,10 @@ class Bottleneck(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c_, c2, 3, 1, g=g)
         self.add = shortcut and c1 == c2
-        self.q_add = torch.nn.quantized.FloatFunctional().add
+        self.q_add = torch.nn.quantized.FloatFunctional()
 
     def forward(self, x):
-        y = self.cv2(self.cv1(x))
-        x.add(y)
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
-
-    def forward_q(self, x):
-        y = self.cv2(self.cv1(x))
-        print(x.type, y.type)
-        print(x.shape, y.shape)
-        x.add(y)
-        return self.q_add(x, self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))
+        return self.q_add.add(x, self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):

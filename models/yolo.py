@@ -62,6 +62,7 @@ class Detect(nn.Module):
                 if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
+                continue
                 y = x[i].sigmoid()
                 if self.inplace:
                     y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[i]  # xy
@@ -73,7 +74,26 @@ class Detect(nn.Module):
                     y = torch.cat((xy, wh, conf), 4)
                 z.append(y.view(bs, -1, self.no))
 
+        return x
         return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+
+    def post_process(self, x):
+        z = []
+        for i in range(self.nl):
+            bs = x[i].shape[0]
+            y = x[i].sigmoid()
+            if self.inplace:
+                y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[i]  # xy
+                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+            else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
+                xy, wh, conf = y.split((2, 2, self.nc + 1), 4)  # y.tensor_split((2, 4, 5), 4)  # torch 1.8.0
+                xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
+                wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
+                y = torch.cat((xy, wh, conf), 4)
+            z.append(y.view(bs, -1, self.no))
+
+        return torch.cat(z, 1)
+
 
     def _make_grid(self, nx=20, ny=20, i=0):
         d = self.anchors[i].device
@@ -132,16 +152,18 @@ class Model(nn.Module):
         initialize_weights(self)
         self.info()
         LOGGER.info('')
+    
+    def post_process(self, x):
+        for m in self.model.modules():
+            if isinstance(m, Detect):
+                return m.post_process(x)
 
     def prepare_quantize(self):
         # modify model
         self.float()
         self.train()
-        # self.fuse_cbr()
-        self.fuse()
-        for m in self.model.modules():
-            if isinstance(m, (Bottleneck)):
-                m.forward = m.forward_q  # update forward
+        self.fuse_cbr()
+        # self.fuse()
 
         self.forward = self._forward_quantized
 
@@ -153,7 +175,8 @@ class Model(nn.Module):
     def _forward_quantized(self, x, augment=False, profile=False, visualize=False):
         x = self.quantize(x)
         x = self._forward_once(x, profile, visualize)  # single-scale inference, train
-        x = self.dequantize(x)
+        for i in range(len(x)):
+            x[i] = self.dequantize(x[i])
         return x
 
     def _forward_augment(self, x):
@@ -260,7 +283,10 @@ class Model(nn.Module):
         LOGGER.info('Fusing layers... ')
         for m in self.model.modules():
             if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
-                m = torch.quantization.fuse_conv_bn_relu(True, m.conv, m.bn, m.act)
+                m.conv = torch.quantization.fuse_conv_bn_relu(True, m.conv, m.bn, m.act)
+                delattr(m, 'bn')  # remove batchnorm
+                delattr(m, 'act')  # remove activite
+                m.forward = m.forward_fuse2  # update forward
         self.info()
         return self
 

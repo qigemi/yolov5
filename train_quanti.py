@@ -38,7 +38,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-import val  # for end-of-epoch mAP
+import val_quanti  # for end-of-epoch mAP
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
@@ -148,27 +148,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             LOGGER.info(f'freezing {k}')
             v.requires_grad = False
 
-    # quantization
+    # test image
     imgg = np.random.rand(1,3,640,640)
     imgg = torch.Tensor(imgg).to('cuda')
-
-    model.prepare_quantize()
-    model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
-    model = torch.quantization.prepare_qat(model) # fake int32
-    print(model)
-    out = model(imgg)
-    print('-------- done 1 ---------------')
-    model_quantize = deepcopy(model).to('cpu').eval()
-    torch.quantization.convert(model_quantize, inplace=True) # int32
-    print(model_quantize)
-    model_quantize(imgg.cpu())
-    print('---------------- done 2 -------------------')
-    
-    torch.save(model_quantize, 'test.pt')
-    tmp = torch.load('test.pt')
-    tmp.eval().to('cpu')
-    tmp(imgg.cpu())
-    print('---------------- done 3 -------------------')
 
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
@@ -185,27 +167,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
     LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
-    g0, g1, g2 = [], [], []  # optimizer parameter groups
-    for v in model.modules():
-        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
-            g2.append(v.bias)
-        if isinstance(v, nn.BatchNorm2d):  # weight (no decay)
-            g0.append(v.weight)
-        elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
-            g1.append(v.weight)
+    model.prepare_quantize()
+    # optimizer = SGD(model.parameters(), lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+    optimizer = SGD(model.parameters(), lr=0.0001, momentum=hyp['momentum'], nesterov=True)
 
-    if opt.optimizer == 'Adam':
-        optimizer = Adam(g0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
-    elif opt.optimizer == 'AdamW':
-        optimizer = AdamW(g0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
-    else:
-        optimizer = SGD(model.parameters(), lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
-
-    # optimizer.add_param_group({'params': g1, 'weight_decay': hyp['weight_decay']})  # add g1 with weight_decay
-    # optimizer.add_param_group({'params': g2})  # add g2 (biases)
-    LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
-                f"{len(g0)} weight (no decay), {len(g1)} weight, {len(g2)} bias")
-    del g0, g1, g2
+    model.qconfig = torch.quantization.get_default_qat_qconfig('qnnpack')
+    # model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+    torch.quantization.prepare_qat(model, inplace=True) # fake int32
+    print('------------- qat model done -----------------')
 
     # Scheduler
     if opt.cos_lr:
@@ -219,7 +188,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
-    if pretrained:
+    if 0:
         # Optimizer
         if ckpt['optimizer'] is not None:
             optimizer.load_state_dict(ckpt['optimizer'])
@@ -311,14 +280,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
-    model_quantize = deepcopy(model).to('cpu').eval()
-    torch.quantization.convert(model_quantize, inplace=True)
-    # torch.save(model_quantize, 'test.pt')
-    # model_quantize = torch.load('test.pt').cpu().evel()
-    # model_quantize.do_quantize = True
-    model_quantize(imgg.cpu())
-    print('---------------- done -------------------')
-
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
@@ -338,6 +299,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
+
+        if epoch > 3:
+            # Freeze quantizer parameters
+            model.apply(torch.quantization.disable_observer)
+        if epoch > 2:
+            # Freeze batch norm mean and variance estimates
+            model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
    
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -392,14 +360,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 loss *= 4.
 
             # Backward
-            scaler.scale(loss).backward()
+            # scaler.scale(loss).backward()
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
 
             # Optimize
-            if ni - last_opt_step >= accumulate:
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                last_opt_step = ni
+            # if ni - last_opt_step >= accumulate:
+            #     scaler.step(optimizer)  # optimizer.step
+            #     scaler.update()
+            #     optimizer.zero_grad()
+            #     last_opt_step = ni
 
             # Log
             if RANK in (-1, 0):
@@ -417,15 +388,22 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         scheduler.step()
 
         if RANK in (-1, 0):
+            # convert to int8 model
+            model_quantize = deepcopy(model).to('cpu').eval()
+            torch.quantization.convert(model_quantize, inplace=True)
+            print('---------------- convert done -------------------')
+
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
             # ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = val.run(data_dict,
+                results, maps, _ = val_quanti.run(data_dict,
                                            batch_size=batch_size // WORLD_SIZE * 2,
                                            imgsz=imgsz,
-                                           model=deepcopy(de_parallel(model)).eval(),
+                                           model=model_quantize.eval(),
+                                        #    model=deepcopy(model).eval(),
+                                           device='cpu',
                                            single_cls=single_cls,
                                            dataloader=val_loader,
                                            save_dir=save_dir,
@@ -441,30 +419,19 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             log_vals = list(mloss) + list(results) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
-            # convert to int8 model
-            model_quantize = deepcopy(model).to('cpu').eval()
-            torch.quantization.convert(model_quantize, inplace=True)
-            model_quantize(imgg)
-            print('---------------- done -------------------')
-
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
-                ckpt = {
-                    'epoch': epoch,
-                    'best_fitness': best_fitness,
-                    'model': model_quantize,
-                    'optimizer': optimizer.state_dict(),
-                    'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
-                    'date': datetime.now().isoformat()}
+                trace_model = torch.jit.trace(model_quantize, torch.Tensor(1,3,640,640))
+                # torch.jit.save(torch.jit.script(model_quantize), 'test.pth')
 
                 # Save last, best and delete
-                torch.save(model_quantize, last)
+                trace_model.save(last)
                 if best_fitness == fi:
-                    torch.save(model_quantize, best)
-                if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
-                    torch.save(ckpt, w / f'epoch{epoch}.pt')
-                del ckpt
+                    trace_model.save(best)
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
+                print('---------------- save done -------------------')
+
+            del model_quantize
 
             # Stop Single-GPU
             if RANK == -1 and stopper(epoch=epoch, fitness=fi):

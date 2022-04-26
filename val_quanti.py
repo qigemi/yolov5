@@ -44,6 +44,7 @@ from utils.general import (LOGGER, check_dataset, check_img_size, check_requirem
 from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, time_sync
+from utils.loss import ComputeLoss
 
 
 def save_one_txt(predn, save_conf, shape, file):
@@ -126,10 +127,11 @@ def run(
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
-        device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
-        half &= device.type != 'cpu'  # half precision only supported on CUDA
-        model.half() if half else model.float()
+        pt, jit, engine = True, False, False  # get model device, PyTorch model
+        half = False
     else:  # called directly
+        print('not doing now')
+        exit(0)
         device = select_device(device, batch_size=batch_size)
 
         # Directories
@@ -154,7 +156,7 @@ def run(
 
     # Configure
     model.eval()
-    cuda = device.type != 'cpu'
+    cuda = device == 'cuda'
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
@@ -190,6 +192,8 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+    compute_loss = ComputeLoss(model)
+
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         t1 = time_sync()
@@ -208,8 +212,7 @@ def run(
         dt[1] += time_sync() - t2
 
         # Loss
-        if compute_loss:
-            loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
+        loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels

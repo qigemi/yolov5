@@ -93,7 +93,13 @@ class ComputeLoss:
 
     # Compute losses
     def __init__(self, model, autobalance=False):
-        device = next(model.parameters()).device  # get model device
+        try:
+            device = next(model.parameters()).device  # get model device
+        except:
+            a = torch.Tensor([1.0])
+            a.cpu()
+            device = a.device
+
         h = model.hyp  # hyperparameters
 
         # Define criteria
